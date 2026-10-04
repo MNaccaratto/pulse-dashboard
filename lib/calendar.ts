@@ -10,7 +10,11 @@ export interface CalendarEvent {
 
 export async function getTodayEvents(): Promise<CalendarEvent[]> {
   const clientEmail = process.env.GOOGLE_CLIENT_EMAIL;
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+  // Aggressively sanitize the private key to fix OpenSSL decoder errors
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY
+    ?.replace(/\\n/g, '\n')
+    .replace(/(^"|"$)/g, '')
+    .replace(/(^'|'$)/g, '');
   const calendarIdsString = process.env.GOOGLE_CALENDAR_IDS;
 
   if (!clientEmail || !privateKey || !calendarIdsString) {
@@ -19,7 +23,6 @@ export async function getTodayEvents(): Promise<CalendarEvent[]> {
   }
 
   const calendarIds = calendarIdsString.split(',').map(id => id.trim());
-  console.log("🔍 Fetching from Calendar IDs:", calendarIds);
 
   const auth = new google.auth.GoogleAuth({
     credentials: {
@@ -34,9 +37,7 @@ export async function getTodayEvents(): Promise<CalendarEvent[]> {
   const todayEnd = endOfDay(new Date()).toISOString();
 
   try {
-    // Fetch all calendars concurrently
     const eventPromises = calendarIds.map(async (calendarId, index) => {
-      console.log(`⏳ Querying calendar: ${calendarId}...`);
       try {
         const response = await calendar.events.list({
           calendarId: calendarId,
@@ -47,13 +48,21 @@ export async function getTodayEvents(): Promise<CalendarEvent[]> {
         });
         
         const events = response.data.items || [];
-        console.log(`📦 Calendar ${index + 1} returned ${events.length} events for today`);
+
+        // Custom Calendar Names
+        const calendarNames = [
+          "Personal", 
+          "College | Courses", 
+          "College | Personal", 
+          "Work | Personal", 
+          "Work | Schedule"
+        ];
 
         return events.map((event) => ({
           id: event.id || Math.random().toString(),
           title: event.summary || 'Busy',
           startTime: event.start?.dateTime || event.start?.date || null,
-          sourceCalendar: `Calendar ${index + 1}`
+          sourceCalendar: calendarNames[index] || `Calendar ${index + 1}`
         }));
       } catch (err: any) {
         console.error(`❌ Failed to fetch calendar ${calendarId}: ${err.message}`);
@@ -61,7 +70,6 @@ export async function getTodayEvents(): Promise<CalendarEvent[]> {
       }
     });
 
-    // Wait for all API calls to finish and flatten the array
     const nestedEvents = await Promise.all(eventPromises);
     const allEvents = nestedEvents.flat();
 

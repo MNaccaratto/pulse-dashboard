@@ -33,12 +33,15 @@ export async function getActiveNotionTasks(): Promise<Task[]> {
       body: JSON.stringify({}) // Fetch everything, filter in-memory
     });
 
-    if (!res.ok) continue;
+    if (!res.ok) {
+      console.error(`❌ Failed to fetch DB ${databaseId}`);
+      continue;
+    }
 
     const data = await res.json();
 
     const parsedTasks = data.results.map((page: any) => {
-      // 1. Dynamic Title parsing
+      // Dynamic Title parsing
       let taskTitle = 'Untitled Task';
       for (const key in page.properties) {
         if (page.properties[key].type === 'title') {
@@ -47,28 +50,30 @@ export async function getActiveNotionTasks(): Promise<Task[]> {
         }
       }
 
-      // 2. Extract Status[cite: 4, 5, 6]
+      // Extract Status
       const statusProp = page.properties['Status'];
-      // Supports both 'select' and 'status' property types in Notion
       const statusValue = statusProp?.status?.name || statusProp?.select?.name || 'Unknown';
 
-      // 3. Extract Due Date[cite: 4, 5, 6]
+      // Extract Due Date
       const dueDateProp = page.properties['Due Date'];
       const dueDate = dueDateProp?.date?.start || null;
+
+      // Custom Database Names
+      const dbNames = ["Academic", "Personal/Professional"];
 
       return {
         id: page.id,
         title: taskTitle,
         dueDate: dueDate,
         status: statusValue,
-        source: `Database ${i + 1}`,
+        source: dbNames[i] || `Database ${i + 1}`,
       };
     });
 
     allTasks.push(...parsedTasks);
   }
 
-  // 4. Apply 7-day lookahead filter
+  // Apply 7-day lookahead filter
   const lookaheadLimit = addDays(new Date(), 7);
 
   const actionableTasks = allTasks.filter(task => {
@@ -88,9 +93,9 @@ export async function getActiveNotionTasks(): Promise<Task[]> {
     return isBefore(parseISO(task.dueDate), lookaheadLimit);
   });
 
-  // 5. Sort chronologically by due date
+  // Sort chronologically by due date
   return actionableTasks.sort((a, b) => {
-    if (!a.dueDate) return 1; // Push unscheduled items to the bottom
+    if (!a.dueDate) return 1; 
     if (!b.dueDate) return -1;
     return new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime();
   });
