@@ -96,14 +96,8 @@ If Notion or Calendar credentials are missing, that half of the page falls back 
 - Secrets live only in `.env.local` (git-ignored) or your host's environment settings. Only `.env.example`, which holds placeholders, is committed.
 - All API calls happen on the server. Tokens and keys are never sent to the browser.
 - Access to the Google Calendar is read-only (`calendar.readonly` scope).
-- `proxy.ts` puts HTTP basic auth in front of every page. In production with no `DASHBOARD_USER` / `DASHBOARD_PASSWORD` set, it responds with 503 instead of serving your data. Demo mode is exempt because it only shows sample data. Basic auth is only safe over HTTPS, which Vercel provides by default.
+- `proxy.ts` puts HTTP basic auth in front of every page. In production with no `DASHBOARD_USER` / `DASHBOARD_PASSWORD` set, it responds with 503 instead of serving your data. Demo mode is exempt because it only shows sample data. Basic auth is only safe over HTTPS, so if you host this anywhere, put it behind HTTPS.
 - Error messages shown on the page are generic. Details are logged server-side only.
-
-## Deploying to Vercel
-
-1. Push the repo to GitHub and import it in [Vercel](https://vercel.com/new).
-2. Add the environment variables above in **Project Settings → Environment Variables**, including `DASHBOARD_USER` and `DASHBOARD_PASSWORD`.
-3. Deploy. To host a public demo instead, set only `USE_MOCK_DATA=true`.
 
 ## Project structure
 
