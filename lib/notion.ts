@@ -1,102 +1,122 @@
-import { addDays, isBefore, parseISO } from 'date-fns';
+import { getDoneStatuses, getTimeZone, LOOKAHEAD_DAYS, parseNamedList, useMockData } from './config';
+import { addDaysToKey, toDateKey } from './dates';
+import { getMockTasks } from './mock';
+import type { FetchResult, Task } from './types';
 
-export interface Task {
-  id: string;
-  title: string;
-  dueDate: string | null;
-  status: string;
-  source: string;
+const NOTION_VERSION = '2022-06-28';
+const PAGE_SIZE = 100;
+const MAX_PAGES = 10; // hard cap so a bad cursor can never loop forever
+
+interface NotionProperty {
+  type: string;
+  title?: { plain_text: string }[];
+  status?: { name: string } | null;
+  select?: { name: string } | null;
+  date?: { start: string } | null;
 }
 
-export async function getActiveNotionTasks(): Promise<Task[]> {
-  const token = process.env.NOTION_TOKEN;
-  const dbIdsString = process.env.NOTION_DATABASE_IDS;
-  
-  if (!token || !dbIdsString) {
-    console.warn("⚠️ Missing NOTION_TOKEN or NOTION_DATABASE_IDS in .env.local");
-    return [];
-  }
+interface NotionPage {
+  id: string;
+  properties: Record<string, NotionProperty>;
+}
 
-  const databaseIds = dbIdsString.split(',').map(id => id.trim());
-  const allTasks: Task[] = [];
-  
-  for (let i = 0; i < databaseIds.length; i++) {
-    const databaseId = databaseIds[i];
-    
+interface NotionQueryResponse {
+  results: NotionPage[];
+  has_more: boolean;
+  next_cursor: string | null;
+}
+
+async function queryDatabase(token: string, databaseId: string, filter: object): Promise<NotionPage[]> {
+  const pages: NotionPage[] = [];
+  let cursor: string | undefined;
+
+  for (let i = 0; i < MAX_PAGES; i++) {
     const res = await fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
       method: 'POST',
+      cache: 'no-store', // never serve stale tasks from Next's fetch cache
       headers: {
-        'Authorization': `Bearer ${token}`,
-        'Notion-Version': '2022-06-28',
-        'Content-Type': 'application/json'
+        Authorization: `Bearer ${token}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json',
       },
-      body: JSON.stringify({}) // Fetch everything, filter in-memory
+      body: JSON.stringify({
+        filter,
+        page_size: PAGE_SIZE,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
     });
 
-    if (!res.ok) {
-      console.error(`❌ Failed to fetch DB ${databaseId}`);
-      continue;
-    }
+    if (!res.ok) throw new Error(`Notion responded with ${res.status}`);
 
-    const data = await res.json();
+    const json = (await res.json()) as NotionQueryResponse;
+    pages.push(...json.results);
+    if (!json.has_more || !json.next_cursor) break;
+    cursor = json.next_cursor;
+  }
+  return pages;
+}
 
-    const parsedTasks = data.results.map((page: any) => {
-      // Dynamic Title parsing
-      let taskTitle = 'Untitled Task';
-      for (const key in page.properties) {
-        if (page.properties[key].type === 'title') {
-          taskTitle = page.properties[key].title?.[0]?.plain_text || 'Untitled Task';
-          break;
-        }
-      }
+function toTask(page: NotionPage, source: string, statusProp: string, dueProp: string): Task {
+  const props = Object.values(page.properties);
+  const titleProp = props.find((p) => p.type === 'title');
+  // Titles are split into rich-text segments; join them all, not just the first.
+  const title = titleProp?.title?.map((t) => t.plain_text).join('').trim() || 'Untitled Task';
 
-      // Extract Status
-      const statusProp = page.properties['Status'];
-      const statusValue = statusProp?.status?.name || statusProp?.select?.name || 'Unknown';
+  const status = page.properties[statusProp];
+  return {
+    id: page.id,
+    title,
+    dueDate: page.properties[dueProp]?.date?.start ?? null,
+    status: status?.status?.name ?? status?.select?.name ?? 'Unknown',
+    source,
+  };
+}
 
-      // Extract Due Date
-      const dueDateProp = page.properties['Due Date'];
-      const dueDate = dueDateProp?.date?.start || null;
+/**
+ * Fetches open tasks due on or before the lookahead limit (overdue included).
+ * Done-status filtering and bucketing happen in lib/tasks.ts so they stay testable.
+ *
+ * Env:
+ *   NOTION_TOKEN, NOTION_DATABASE_IDS ("Academic=abc123,Personal=def456")
+ *   NOTION_STATUS_PROPERTY (default "Status"), NOTION_DUE_PROPERTY (default "Due Date")
+ *   NOTION_DONE_CHECKBOX_PROPERTY (optional): also filters server-side on checkbox == false
+ */
+export async function getActiveNotionTasks(now = new Date()): Promise<FetchResult<Task[]>> {
+  const timeZone = getTimeZone();
+  const today = toDateKey(now, timeZone);
 
-      // Custom Database Names
-      const dbNames = ["Academic", "Personal/Professional"];
+  const token = process.env.NOTION_TOKEN;
+  const databases = parseNamedList(process.env.NOTION_DATABASE_IDS, 'Database');
 
-      return {
-        id: page.id,
-        title: taskTitle,
-        dueDate: dueDate,
-        status: statusValue,
-        source: dbNames[i] || `Database ${i + 1}`,
-      };
-    });
-
-    allTasks.push(...parsedTasks);
+  if (useMockData() || !token || databases.length === 0) {
+    if (!useMockData()) console.warn('⚠️ Notion credentials missing, showing demo data.');
+    return { data: getMockTasks(today), errors: [], isMock: true };
   }
 
-  // Apply 7-day lookahead filter
-  const lookaheadLimit = addDays(new Date(), 7);
+  const statusProp = process.env.NOTION_STATUS_PROPERTY || 'Status';
+  const dueProp = process.env.NOTION_DUE_PROPERTY || 'Due Date';
+  const checkboxProp = process.env.NOTION_DONE_CHECKBOX_PROPERTY;
 
-  const actionableTasks = allTasks.filter(task => {
-    const statusLower = task.status.toLowerCase();
-    
-    // Drop completed items
-    if (statusLower.includes('done') || statusLower.includes('complete')) {
-      return false; 
-    }
+  const clauses: object[] = [{ property: dueProp, date: { on_or_before: addDaysToKey(today, LOOKAHEAD_DAYS) } }];
+  if (checkboxProp) clauses.push({ property: checkboxProp, checkbox: { equals: false } });
+  const filter = { and: clauses };
 
-    // Keep active tasks that don't have a specific due date yet
-    if (!task.dueDate) {
-       return true; 
-    }
+  const errors: string[] = [];
+  const results = await Promise.all(
+    databases.map(async ({ name, id }) => {
+      try {
+        const pages = await queryDatabase(token, id, filter);
+        return pages.map((p) => toTask(p, name, statusProp, dueProp));
+      } catch (err) {
+        console.error(`❌ Notion database "${name}" failed:`, err instanceof Error ? err.message : err);
+        errors.push(`Couldn't load tasks from "${name}".`);
+        return [];
+      }
+    }),
+  );
 
-    // Keep items due within the next 7 days (or overdue)
-    return isBefore(parseISO(task.dueDate), lookaheadLimit);
-  });
-
-  // Sort chronologically by due date
-  return actionableTasks.sort((a, b) => {
-    if (!a.dueDate) return 1; 
-    if (!b.dueDate) return -1;
-    return new Date(a.dueDate).getTime() - new Date(b.dueDate).getTime();
-  });
+  // Drop finished tasks here too so callers get a clean list even without bucketing.
+  const done = getDoneStatuses();
+  const data = results.flat().filter((t) => !done.has(t.status.trim().toLowerCase()));
+  return { data, errors, isMock: false };
 }
